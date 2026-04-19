@@ -1,0 +1,115 @@
+import { Schema, model, Document, Types } from 'mongoose';
+import type { EvaluationStatus, ProposalType, Priority } from '../types';
+
+export interface IEvaluation extends Omit<Document, 'model'> {
+  _id: Types.ObjectId;
+  developer: Types.ObjectId;
+  periodStart: Date;
+  periodEnd: Date;
+  periodLabel?: string;
+  groups: Types.ObjectId[];
+  repositories: Types.ObjectId[];
+  commits: Types.ObjectId[];
+  stats: {
+    commitsCount: number;
+    additions: number;
+    deletions: number;
+    filesChanged: number;
+    activeDays: number;
+    languages: string[];
+  };
+  scores: {
+    codeQuality?: number;
+    commitFrequency?: number;
+    conventionAdherence?: number;
+    technicalComplexity?: number;
+    overall?: number;
+  };
+  analysis: {
+    summary?: string;
+    strengths: string[];
+    weaknesses: string[];
+    recommendations: string[];
+    notableCommits: Array<{ sha: string; comment: string }>;
+  };
+  proposal: {
+    type: ProposalType;
+    title?: string;
+    rationale?: string;
+    priority: Priority;
+  };
+  model?: string;
+  tokensUsed?: { input: number; output: number };
+  status: EvaluationStatus;
+  error?: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const EvaluationSchema = new Schema<IEvaluation>(
+  {
+    developer: { type: Schema.Types.ObjectId, ref: 'Developer', required: true, index: true },
+
+    periodStart: { type: Date, required: true, index: true },
+    periodEnd: { type: Date, required: true, index: true },
+    periodLabel: { type: String },
+
+    groups: [{ type: Schema.Types.ObjectId, ref: 'Group' }],
+    repositories: [{ type: Schema.Types.ObjectId, ref: 'Repository' }],
+    commits: [{ type: Schema.Types.ObjectId, ref: 'Commit' }],
+
+    stats: {
+      commitsCount: { type: Number, default: 0 },
+      additions: { type: Number, default: 0 },
+      deletions: { type: Number, default: 0 },
+      filesChanged: { type: Number, default: 0 },
+      activeDays: { type: Number, default: 0 },
+      languages: [String],
+    },
+
+    scores: {
+      codeQuality: { type: Number, min: 0, max: 100 },
+      commitFrequency: { type: Number, min: 0, max: 100 },
+      conventionAdherence: { type: Number, min: 0, max: 100 },
+      technicalComplexity: { type: Number, min: 0, max: 100 },
+      overall: { type: Number, min: 0, max: 100, index: true },
+    },
+
+    analysis: {
+      summary: String,
+      strengths: [String],
+      weaknesses: [String],
+      recommendations: [String],
+      notableCommits: [{ sha: String, comment: String }],
+    },
+
+    proposal: {
+      type: {
+        type: String,
+        enum: ['promotion', 'bonus', 'training', 'mentoring', 'recognition', 'warning', 'none'],
+        default: 'none',
+      },
+      title: String,
+      rationale: String,
+      priority: { type: String, enum: ['low', 'medium', 'high'], default: 'low' },
+    },
+
+    model: String,
+    tokensUsed: {
+      input: Number,
+      output: Number,
+    },
+    status: {
+      type: String,
+      enum: ['pending', 'in_progress', 'completed', 'failed', 'skipped'],
+      default: 'pending',
+      index: true,
+    },
+    error: String,
+  },
+  { timestamps: true }
+);
+
+EvaluationSchema.index({ developer: 1, periodStart: 1, periodEnd: 1 }, { unique: true });
+
+export const Evaluation = model<IEvaluation>('Evaluation', EvaluationSchema);
