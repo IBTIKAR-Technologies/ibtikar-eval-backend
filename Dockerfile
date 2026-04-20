@@ -1,19 +1,14 @@
-FROM node:20-alpine AS deps
+FROM node:20-alpine AS builder
 WORKDIR /app
 ENV NODE_ENV=development
 
 COPY package.json yarn.lock ./
 RUN corepack enable && yarn install --frozen-lockfile --production=false
 
-FROM node:20-alpine AS builder
-WORKDIR /app
-ENV NODE_ENV=development
-
-COPY --from=deps /app/node_modules ./node_modules
 COPY tsconfig.json ./
 COPY src ./src
 COPY scripts ./scripts
-RUN corepack enable && yarn build
+RUN yarn build
 
 FROM node:20-alpine AS prod-deps
 WORKDIR /app
