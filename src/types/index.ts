@@ -39,6 +39,29 @@ export interface Period {
   label: string;
 }
 
+export interface JiraIssueSummary {
+  key: string;
+  summary: string;
+  status: string;
+  issueType: string;
+  priority?: string;
+  storyPoints?: number;
+  updatedAt?: string;
+  url?: string;
+}
+
+export interface JiraEvaluationContext {
+  accountId?: string;
+  issuesCount: number;
+  backlogCount: number;
+  doneCount: number;
+  inProgressCount: number;
+  storyPointsCompleted: number;
+  labels: string[];
+  statusBreakdown: Array<{ status: string; count: number }>;
+  issues: JiraIssueSummary[];
+}
+
 /** Sortie JSON attendue du modèle d'évaluation (Gemini, etc.) */
 export interface LlmEvaluationOutput {
   scores: {
@@ -105,4 +128,5 @@ export interface DeveloperEvaluationPayload {
     repoFullName: string | undefined;
     repoPlatform: string | undefined;
   }>;
+  jira?: JiraEvaluationContext;
 }

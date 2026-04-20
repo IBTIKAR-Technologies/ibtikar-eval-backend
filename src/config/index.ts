@@ -22,6 +22,13 @@ function geminiApiKey(): string {
   return v;
 }
 
+function splitCsv(v?: string): string[] {
+  return (v ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 export interface AppConfig {
   env: string;
   port: number;
@@ -33,6 +40,14 @@ export interface AppConfig {
     maxRetries: number;
     concurrency: number;
     delayBetweenEvaluationsMs: number;
+  };
+  jira: {
+    enabled: boolean;
+    baseUrl?: string;
+    email?: string;
+    apiToken?: string;
+    projectKeys: string[];
+    syncLookbackDays: number;
   };
   cron: { schedule: string; timezone: string; runOnStart: boolean };
   limits: { maxCommitsPerDev: number; maxFilesPerCommit: number; maxDiffChars: number };
@@ -61,6 +76,17 @@ const config: AppConfig = {
       0,
       parseInt(process.env.GEMINI_EVAL_DELAY_MS ?? '2000', 10)
     ),
+  },
+
+  jira: {
+    enabled:
+      process.env.JIRA_ENABLED === 'true' ||
+      (!!process.env.JIRA_BASE_URL && !!process.env.JIRA_EMAIL && !!process.env.JIRA_API_TOKEN),
+    baseUrl: process.env.JIRA_BASE_URL?.trim(),
+    email: process.env.JIRA_EMAIL?.trim(),
+    apiToken: process.env.JIRA_API_TOKEN?.trim(),
+    projectKeys: splitCsv(process.env.JIRA_PROJECT_KEYS),
+    syncLookbackDays: Math.max(1, parseInt(process.env.JIRA_SYNC_LOOKBACK_DAYS ?? '90', 10)),
   },
 
   cron: {

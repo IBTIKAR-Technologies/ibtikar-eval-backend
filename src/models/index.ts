@@ -4,3 +4,4 @@ export { Repository, type IRepository } from './Repository';
 export { Commit, type ICommit, type ICommitFile } from './Commit';
 export { Evaluation, type IEvaluation } from './Evaluation';
 export { CronRun, type ICronRun } from './CronRun';
+export { Projet, type IProjet } from './Projet';

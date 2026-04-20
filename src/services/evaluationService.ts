@@ -12,6 +12,7 @@ import {
 } from '../models';
 import githubService from './githubService';
 import geminiService, { GeminiQuotaBlockedError } from './geminiService';
+import jiraService from './jiraService';
 import config from '../config';
 import logger from '../utils/logger';
 import type { Period, CronTrigger, DeveloperEvaluationPayload } from '../types';
@@ -364,6 +365,15 @@ class EvaluationService {
       })),
     };
 
+    // Activité Jira séparée (optionnelle) : stockée dans `evaluation.jira` et envoyée au prompt.
+    const jira = await jiraService.getDeveloperContext({
+      developerEmail: dev.email,
+      developerUsername: dev.githubUsername,
+      period,
+      maxIssues: 25,
+    });
+    if (jira) payload.jira = jira;
+
     const llm = await geminiService.evaluateDeveloper(payload);
 
     await Evaluation.findOneAndUpdate(
@@ -383,6 +393,7 @@ class EvaluationService {
         stats,
         scores: llm.scores,
         analysis: llm.analysis,
+        jira: jira ?? undefined,
         proposal: llm.proposal,
         model: llm._meta.model,
         tokensUsed: llm._meta.tokensUsed,

@@ -30,7 +30,7 @@ class GeminiService {
   private systemPrompt(): string {
     return `Tu es un évaluateur technique senior chez Ibtikar, spécialisé dans l'analyse de code et la gestion des performances développeurs.
 
-Tu reçois les commits d'un développeur sur une semaine. Tu dois produire une évaluation STRICTEMENT au format JSON demandé, sans texte avant ou après, sans markdown, sans backticks.
+Tu reçois les commits d'un développeur sur une semaine et, si disponible, son activité Jira. Tu dois produire une évaluation STRICTEMENT au format JSON demandé, sans texte avant ou après, sans markdown, sans backticks.
 
 Critères d'évaluation (chacun noté de 0 à 100) :
 1. codeQuality : lisibilité, nommage, structure, gestion d'erreurs, absence de duplication
@@ -47,7 +47,9 @@ Ensuite tu proposes UNE action RH/technique moderne adaptée :
 - "warning" : problèmes sérieux (commits vides, code cassé, inactivité suspecte)
 - "none" : semaine normale sans action particulière
 
-Sois juste, factuel, bienveillant mais honnête. Appuie-toi sur les données fournies.`;
+Sois juste, factuel, bienveillant mais honnête. Appuie-toi sur les données fournies.
+
+IMPORTANT : si les données Jira sont présentes, utilise-les comme signal complémentaire d'exécution (delivery, suivi de tickets, clôture), sans surévaluer un développeur uniquement sur le volume de tickets.`;
   }
 
   private userPrompt(p: DeveloperEvaluationPayload): string {
@@ -70,6 +72,13 @@ ${filesStr}${patchExcerpt}`;
       })
       .join('\n\n');
 
+    const jiraSection = p.jira
+      ? `\nActivité Jira (séparée, optionnelle) :\n- AccountId : ${p.jira.accountId ?? 'N/A'}\n- Tickets vus : ${p.jira.issuesCount}\n- Tickets Backlog/To Do/Open : ${p.jira.backlogCount}\n- Tickets Done/Closed : ${p.jira.doneCount}\n- Tickets In Progress/Review : ${p.jira.inProgressCount}\n- Story points complétés : ${p.jira.storyPointsCompleted}\n- Répartition statuts : ${p.jira.statusBreakdown.map((s) => `${s.status}(${s.count})`).join(', ') || 'N/A'}\n- Labels fréquents : ${p.jira.labels.join(', ') || 'N/A'}\n- Exemples tickets :\n${p.jira.issues
+          .slice(0, 8)
+          .map((i) => `  - ${i.key} | ${i.status} | ${i.issueType} | ${i.summary}`)
+          .join('\n') || '  (aucun ticket)'}`
+      : '\nActivité Jira : non disponible pour ce développeur.';
+
     return `Développeur évalué : ${p.developer.fullName} (@${p.developer.githubUsername}) — rôle: ${p.developer.role}
 
 Période : ${p.period.label} (du ${p.period.start.toISOString().slice(0, 10)} au ${p.period.end.toISOString().slice(0, 10)})
@@ -82,6 +91,7 @@ Statistiques agrégées :
 - Jours actifs : ${p.stats.activeDays} / 7
 - Langages : ${p.stats.languages.join(', ') || 'N/A'}
 - Projets : ${p.stats.groupNames.join(', ') || 'N/A'}
+${jiraSection}
 
 Détail des commits :
 ${commitsSummary || '(aucun commit cette semaine)'}

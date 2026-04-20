@@ -32,6 +32,26 @@ export interface IEvaluation extends Omit<Document, 'model'> {
     recommendations: string[];
     notableCommits: Array<{ sha: string; comment: string }>;
   };
+  jira?: {
+    accountId?: string;
+    issuesCount: number;
+    backlogCount: number;
+    doneCount: number;
+    inProgressCount: number;
+    storyPointsCompleted: number;
+    labels: string[];
+    statusBreakdown: Array<{ status: string; count: number }>;
+    issues: Array<{
+      key: string;
+      summary: string;
+      status: string;
+      issueType: string;
+      priority?: string;
+      storyPoints?: number;
+      updatedAt?: string;
+      url?: string;
+    }>;
+  };
   proposal: {
     type: ProposalType;
     title?: string;
@@ -81,6 +101,29 @@ const EvaluationSchema = new Schema<IEvaluation>(
       weaknesses: [String],
       recommendations: [String],
       notableCommits: [{ sha: String, comment: String }],
+    },
+
+    jira: {
+      accountId: String,
+      issuesCount: { type: Number, default: 0 },
+      backlogCount: { type: Number, default: 0 },
+      doneCount: { type: Number, default: 0 },
+      inProgressCount: { type: Number, default: 0 },
+      storyPointsCompleted: { type: Number, default: 0 },
+      labels: [String],
+      statusBreakdown: [{ status: String, count: Number }],
+      issues: [
+        {
+          key: String,
+          summary: String,
+          status: String,
+          issueType: String,
+          priority: String,
+          storyPoints: Number,
+          updatedAt: String,
+          url: String,
+        },
+      ],
     },
 
     proposal: {
