@@ -1,0 +1,15 @@
+node_modules
+dist
+.git
+.gitignore
+.cursor
+.claude
+.gemini
+logs
+coverage
+*.log
+.DS_Store
+.env
+.env.local
+.env.*
+!.env.example

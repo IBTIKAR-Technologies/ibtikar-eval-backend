@@ -1,0 +1,51 @@
+services:
+  mongo:
+    image: mongo:7
+    container_name: ibtikar-eval-mongo
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ibtikar-eval-backend
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: ${PORT:-4000}
+      MONGODB_URI: ${MONGODB_URI:-mongodb://mongo:27017/ibtikar_eval}
+
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      GITHUB_ORG: ${GITHUB_ORG:-IBTIKAR-Technologies}
+
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.0-flash}
+      GEMINI_CONCURRENCY: ${GEMINI_CONCURRENCY:-1}
+      GEMINI_EVAL_DELAY_MS: ${GEMINI_EVAL_DELAY_MS:-3000}
+      GEMINI_MAX_RETRIES: ${GEMINI_MAX_RETRIES:-4}
+
+      CRON_SCHEDULE: ${CRON_SCHEDULE:-0 2 * * 1}
+      CRON_TIMEZONE: ${CRON_TIMEZONE:-Africa/Nouakchott}
+      CRON_RUN_ON_START: ${CRON_RUN_ON_START:-false}
+
+      MAX_COMMITS_PER_DEV: ${MAX_COMMITS_PER_DEV:-30}
+      MAX_FILES_PER_COMMIT: ${MAX_FILES_PER_COMMIT:-10}
+      MAX_DIFF_CHARS: ${MAX_DIFF_CHARS:-15000}
+
+      DASHBOARD_ORIGIN: ${DASHBOARD_ORIGIN:-http://localhost:3000}
+    ports:
+      - "4000:4000"
+
+volumes:
+  mongo_data:

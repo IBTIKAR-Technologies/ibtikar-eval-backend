@@ -10,6 +10,10 @@
     "cron:run": "tsx src/jobs/runEvaluationOnce.ts",
     "seed": "tsx scripts/seed.ts",
     "sync:github": "tsx scripts/syncGithubToDb.ts",
+    "docker:build": "docker compose -f docker-compose.prod.yml build",
+    "docker:up": "docker compose -f docker-compose.prod.yml up -d",
+    "docker:down": "docker compose -f docker-compose.prod.yml down",
+    "docker:logs": "docker compose -f docker-compose.prod.yml logs -f app",
     "lint": "tsc --noEmit",
     "clean": "rm -rf dist"
   },
