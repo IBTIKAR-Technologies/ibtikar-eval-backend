@@ -7,11 +7,20 @@ import type {
   LlmEvaluationOutput,
 } from '../types';
 
-/** Quota / facturation Google insuffisant — les retries ne servent à rien. */
 export class GeminiQuotaBlockedError extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
     super(message);
     this.name = 'GeminiQuotaBlockedError';
+    if (options?.cause !== undefined) {
+      (this as Error & { cause?: unknown }).cause = options.cause;
+    }
+  }
+}
+
+export class GeminiTransientOutputError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message);
+    this.name = 'GeminiTransientOutputError';
     if (options?.cause !== undefined) {
       (this as Error & { cause?: unknown }).cause = options.cause;
     }
@@ -28,96 +37,189 @@ class GeminiService {
   }
 
   private systemPrompt(): string {
-    return `Tu es un évaluateur technique senior chez Ibtikar, spécialisé dans l'analyse de code et la gestion des performances développeurs.
+    return `You are a senior technical reviewer at Ibtikar. You perform a rigorous CODE REVIEW of a developer's Git activity and produce a structured evaluation.
 
-Tu reçois les commits d'un développeur sur une semaine et, si disponible, son activité Jira. Tu dois produire une évaluation STRICTEMENT au format JSON demandé, sans texte avant ou après, sans markdown, sans backticks.
+## CRITICAL PRINCIPLE
+Your evaluation MUST be grounded in the ACTUAL CODE shown in the diffs (the "PATCH" sections), NOT in the commit messages. A commit message is a label — the code is the truth. If a commit message says "fix bug" but the diff shows a hack, score the code, not the message. If a commit message is vague but the code is excellent, reward the code.
 
-Critères d'évaluation (chacun noté de 0 à 100) :
-1. codeQuality : lisibilité, nommage, structure, gestion d'erreurs, absence de duplication
-2. commitFrequency : régularité du travail (commits étalés vs tout en un jour), taille raisonnable
-3. conventionAdherence : messages de commit clairs (conventional commits), cohérence style
-4. technicalComplexity : ampleur et difficulté technique du travail
+You read each diff line by line. You evaluate what the developer actually wrote: logic, structure, naming, error handling, edge cases, security, performance, testability.
 
-Ensuite tu proposes UNE action RH/technique moderne adaptée :
-- "promotion" : performance exceptionnelle soutenue
-- "bonus" : semaine particulièrement productive ou livraison critique
-- "recognition" : féliciter publiquement (slack, all-hands)
-- "mentoring" : le dev devrait coacher les juniors
-- "training" : lacunes identifiées → formation ciblée
-- "warning" : problèmes sérieux (commits vides, code cassé, inactivité suspecte)
-- "none" : semaine normale sans action particulière
+## EVALUATION DIMENSIONS
 
-Sois juste, factuel, bienveillant mais honnête. Appuie-toi sur les données fournies.
+### 1. COMMITS — process hygiene (3 sub-scores)
+**normsScore** (0–100) — Commit message quality
+- Conventional Commits style (feat:, fix:, chore:, refactor:, docs:, test:, perf:) → +
+- Clear, imperative, explains the WHY when non-obvious → +
+- Vague messages ("fix", "update", "wip", "tmp", "."), duplicates → −
 
-IMPORTANT : si les données Jira sont présentes, utilise-les comme signal complémentaire d'exécution (delivery, suivi de tickets, clôture), sans surévaluer un développeur uniquement sur le volume de tickets.`;
+**separationScore** (0–100) — Commit atomicity (verify against the actual diff)
+- One commit = one coherent intent visible in the diff → +
+- Diff mixes unrelated concerns (feature + refactor + formatting + unrelated fix) → −
+- Huge dump commits (>500 lines, >15 files) without justification → −
+- End-of-sprint "dump everything" pattern → −
+
+**frequencyScore** (0–100) — Cadence over the period
+- Commits spread across multiple days of the active window → +
+- Everything bunched into a single day → −
+- 0 commits → frequencyScore = 0 automatically
+
+### 2. CODE QUALITY (0–100) — THE CENTRAL SCORE, READ THE DIFFS
+Inspect each PATCH and judge the code itself:
+- **Correctness & logic**: does the code actually do what it claims? any obvious bugs, off-by-one, race conditions, broken control flow?
+- **Readability**: meaningful names, short focused functions, no dense unreadable blocks
+- **Structure & design**: separation of concerns, low coupling, no god-functions, sensible abstractions (no over-engineering either)
+- **Error handling**: try/catch where it matters, no swallowed errors, validation at boundaries, meaningful error messages
+- **Safety**: no hardcoded secrets, no SQL injection, no XSS, no unsanitized inputs, no unsafe \`eval\`/\`exec\`
+- **Cleanliness**: no commented-out code, dead code, TODO without context, debug flags
+- **Tests**: presence and quality of tests when the change warrants them
+- **Consistency**: matches the conventions visible in surrounding code
+- **No anti-patterns**: copy-paste duplication, magic numbers, nested callback hell, mutable globals
+
+If diffs are tiny/cosmetic across the whole period, codeQuality cannot be high regardless of message quality.
+
+### 3. PRODUCTIVITY (0–100)
+- Real, meaningful work volume (substantive additions/deletions, not whitespace/rename churn)
+- Diversity of files and projects touched, balanced with focus
+- Active days vs. evaluation window (e.g. 5/7 days = excellent)
+- Technical complexity inferred from the diffs (business logic, algorithms, integrations) vs. trivial edits
+### 4. OVERALL (0–100)
+Weighted score:
+overall = round(normsScore×0.15 + separationScore×0.15 + frequencyScore×0.10 + codeQuality×0.35 + productivity×0.25)
+
+## SCORING SCALE
+- 0–40: insufficient, serious issues to fix
+- 41–60: acceptable but notable gaps
+- 61–75: good, meets expectations for the role
+- 76–90: very good, regularly exceeds expectations
+- 91–100: exceptional, role model for the team
+
+## HR PROPOSAL
+Pick exactly ONE action:
+- "promotion": overall ≥ 85 AND sustained performance signals
+- "bonus": critical delivery or exceptional week (overall ≥ 80)
+- "recognition": noteworthy contribution worth public praise
+- "mentoring": senior profile who should coach juniors
+- "training": identified gaps → targeted training
+- "warning": serious problems (broken/empty commits, unsafe code, unjustified inactivity)
+- "none": normal week, no specific action
+
+## OUTPUT RULES
+- Be factual and specific. Every strength/weakness must cite a concrete observation from the diffs (file name, function, or commit sha).
+- Ground codeQuality and notableCommits in actual code you read in the PATCH sections, not in commit messages.
+- A developer with 0 commits gets frequencyScore=0 and a minimal evaluation.
+- Write the analysis fields (summary, strengths, weaknesses, recommendations, notableCommits.comment, proposal.title, proposal.rationale) in FRENCH.
+- Return ONLY the requested JSON — no surrounding text, no markdown, no backticks.`;
   }
 
   private userPrompt(p: DeveloperEvaluationPayload): string {
-    const commitsSummary = p.commits
+    const MAX_COMMITS = 25;
+    const MAX_FILES_PER_COMMIT = 10;
+    const MAX_PATCH_CHARS = 2500;
+    const TOTAL_PATCH_BUDGET = 120_000;
+
+    const commitsForPrompt = p.commits.slice(0, MAX_COMMITS);
+    let patchBudget = TOTAL_PATCH_BUDGET;
+
+    const commitsSummary = commitsForPrompt
       .map((c, i) => {
-        const filesStr = (c.files ?? [])
-          .slice(0, 5)
-          .map((f) => `    - ${f.filename} (+${f.additions}/-${f.deletions})`)
+        const files = c.files ?? [];
+        const filesList = files
+          .slice(0, MAX_FILES_PER_COMMIT)
+          .map((f) => `    - ${f.filename} [${f.status}] (+${f.additions}/-${f.deletions})`)
           .join('\n');
-        const patchExcerpt = (c.files ?? [])
-          .slice(0, 3)
-          .map((f) => (f.patch ? `\n    PATCH ${f.filename}:\n${f.patch.slice(0, 1200)}` : ''))
-          .join('\n');
-        return `Commit #${i + 1} [${c.sha.slice(0, 7)}] ${c.committedAt ?? ''}
+
+        const patchBlocks: string[] = [];
+        for (const f of files.slice(0, MAX_FILES_PER_COMMIT)) {
+          if (!f.patch) continue;
+          if (patchBudget <= 0) {
+            patchBlocks.push(`\n    [PATCH ${f.filename}: omitted, prompt size budget reached]`);
+            break;
+          }
+          const slice = f.patch.slice(0, Math.min(MAX_PATCH_CHARS, patchBudget));
+          const truncated = f.patch.length > slice.length ? '\n    ...[truncated]' : '';
+          patchBlocks.push(
+            `\n    PATCH ${f.filename}:\n\`\`\`diff\n${slice}${truncated}\n\`\`\``
+          );
+          patchBudget -= slice.length;
+        }
+
+        const omittedFiles =
+          files.length > MAX_FILES_PER_COMMIT
+            ? `\n    (+${files.length - MAX_FILES_PER_COMMIT} fichier(s) supplémentaire(s) non affiché(s))`
+            : '';
+
+        return `### Commit #${i + 1} [${c.sha.slice(0, 7)}] — ${c.committedAt ?? ''}
   Repo: ${c.repoFullName ?? '?'} (${c.repoPlatform ?? '?'})
   Message: ${c.message}
   Stats: +${c.additions} / -${c.deletions}, ${c.filesChanged} fichier(s)
   Fichiers:
-${filesStr}${patchExcerpt}`;
+${filesList}${omittedFiles}${patchBlocks.join('')}`;
       })
       .join('\n\n');
 
+    const omittedCommits =
+      p.commits.length > MAX_COMMITS
+        ? `\n\n_Note: ${p.commits.length - MAX_COMMITS} commit(s) supplémentaire(s) non détaillé(s) ici._`
+        : '';
+
     const jiraSection = p.jira
-      ? `\nActivité Jira (séparée, optionnelle) :\n- AccountId : ${p.jira.accountId ?? 'N/A'}\n- Tickets vus : ${p.jira.issuesCount}\n- Tickets Backlog/To Do/Open : ${p.jira.backlogCount}\n- Tickets Done/Closed : ${p.jira.doneCount}\n- Tickets In Progress/Review : ${p.jira.inProgressCount}\n- Story points complétés : ${p.jira.storyPointsCompleted}\n- Répartition statuts : ${p.jira.statusBreakdown.map((s) => `${s.status}(${s.count})`).join(', ') || 'N/A'}\n- Labels fréquents : ${p.jira.labels.join(', ') || 'N/A'}\n- Exemples tickets :\n${p.jira.issues
+      ? `\n## Activité Jira (signal complémentaire)\n- Tickets vus : ${p.jira.issuesCount} | Done : ${p.jira.doneCount} | En cours : ${p.jira.inProgressCount} | Backlog : ${p.jira.backlogCount}\n- Story points complétés : ${p.jira.storyPointsCompleted}\n- Statuts : ${p.jira.statusBreakdown.map((s) => `${s.status}(${s.count})`).join(', ') || 'N/A'}\n- Labels : ${p.jira.labels.join(', ') || 'N/A'}\n- Exemples tickets :\n${p.jira.issues
           .slice(0, 8)
-          .map((i) => `  - ${i.key} | ${i.status} | ${i.issueType} | ${i.summary}`)
+          .map((i) => `  • [${i.key}] ${i.status} | ${i.issueType} — ${i.summary}`)
           .join('\n') || '  (aucun ticket)'}`
-      : '\nActivité Jira : non disponible pour ce développeur.';
+      : '\n## Activité Jira : non disponible.';
 
-    return `Développeur évalué : ${p.developer.fullName} (@${p.developer.githubUsername}) — rôle: ${p.developer.role}
+    const auditSection = p.githubAudit
+      ? `\n## GitHub Audit (période)\n- Repos distincts touchés : ${p.githubAudit.reposCount}\n- Pull Requests ouvertes/fusionnées : ${p.githubAudit.pullsCount}\n- Commits enregistrés : ${p.githubAudit.commitsCount}`
+      : '';
 
-Période : ${p.period.label} (du ${p.period.start.toISOString().slice(0, 10)} au ${p.period.end.toISOString().slice(0, 10)})
+    return `# Developer evaluation request
 
-Statistiques agrégées :
-- Commits : ${p.stats.commitsCount}
-- Lignes ajoutées : ${p.stats.additions}
-- Lignes supprimées : ${p.stats.deletions}
-- Fichiers modifiés : ${p.stats.filesChanged}
-- Jours actifs : ${p.stats.activeDays} / 7
-- Langages : ${p.stats.languages.join(', ') || 'N/A'}
-- Projets : ${p.stats.groupNames.join(', ') || 'N/A'}
+**Developer:** ${p.developer.fullName} (@${p.developer.githubUsername}) — role: ${p.developer.role}
+**Period:** ${p.period.label} (${p.period.start.toISOString().slice(0, 10)} → ${p.period.end.toISOString().slice(0, 10)})
+
+## Aggregated stats
+- Commits: ${p.stats.commitsCount}
+- Lines added: ${p.stats.additions} / removed: ${p.stats.deletions}
+- Files changed: ${p.stats.filesChanged}
+- Active days: ${p.stats.activeDays} / 7
+- Languages: ${p.stats.languages.join(', ') || 'N/A'}
+- Projects: ${p.stats.groupNames.join(', ') || 'N/A'}
+${auditSection}
 ${jiraSection}
 
-Détail des commits :
-${commitsSummary || '(aucun commit cette semaine)'}
+## Commits with code diffs (PRIMARY EVIDENCE — review the PATCH sections)
+${commitsSummary || '(no commit during this period)'}${omittedCommits}
 
-Retourne UNIQUEMENT ce JSON (aucun texte autour) :
+## How to evaluate
+Read each PATCH block as a code reviewer would. Judge correctness, structure, naming, error handling, security, cleanliness, and consistency from the actual diff lines. Quote concrete signals (file names, function names, commit shas) in your analysis. Commit messages may be misleading — trust the code.
+
+## Required response format
+Return ONLY this JSON (no surrounding text, no markdown, no backticks). All free-text fields must be in French:
 {
   "scores": {
+    "commits": {
+      "normsScore": 0,
+      "separationScore": 0,
+      "frequencyScore": 0
+    },
     "codeQuality": 0,
-    "commitFrequency": 0,
-    "conventionAdherence": 0,
-    "technicalComplexity": 0,
+    "productivity": 0,
     "overall": 0
   },
   "analysis": {
-    "summary": "2-3 phrases en français",
-    "strengths": ["point fort 1", "point fort 2"],
-    "weaknesses": ["point à améliorer 1"],
-    "recommendations": ["recommandation 1", "recommandation 2"],
+    "summary": "2-3 phrases en français résumant la semaine du développeur, ancrées sur le code observé",
+    "strengths": ["point fort concret tiré du code (citer fichier/fonction)", "..."],
+    "weaknesses": ["point à améliorer tiré du code (citer fichier/fonction)", "..."],
+    "recommendations": ["recommandation actionnable 1", "recommandation actionnable 2"],
     "notableCommits": [
-      { "sha": "abc1234", "comment": "pourquoi ce commit est notable" }
+      { "sha": "abc1234", "comment": "pourquoi ce commit est notable d'après le diff" }
     ]
   },
   "proposal": {
     "type": "promotion|bonus|recognition|mentoring|training|warning|none",
-    "title": "titre court",
-    "rationale": "1-2 phrases qui justifient",
+    "title": "titre court de l'action proposée",
+    "rationale": "1-2 phrases justifiant le choix",
     "priority": "low|medium|high"
   }
 }`;
@@ -127,7 +229,6 @@ Retourne UNIQUEMENT ce JSON (aucun texte autour) :
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  /** Extrait un délai conseillé dans le message d’erreur Google (ex. retry in 40.39s). */
   private retryAfterMsFromError(err: unknown): number | null {
     const msg = err instanceof Error ? err.message : String(err);
     const m = msg.match(/retry in ([\d.]+)\s*s/i);
@@ -135,7 +236,6 @@ Retourne UNIQUEMENT ce JSON (aucun texte autour) :
     return null;
   }
 
-  /** Erreur où attendre ne résout rien (facturation, quota jour à 0, modèle indisponible sur le plan). */
   private isFatalQuotaIssue(err: unknown): boolean {
     const msg = err instanceof Error ? err.message : String(err);
     if (/\blimit:\s*0\b/i.test(msg)) return true;
@@ -145,6 +245,7 @@ Retourne UNIQUEMENT ce JSON (aucun texte autour) :
   }
 
   private isRetryableGeminiError(err: unknown): boolean {
+    if (err instanceof GeminiTransientOutputError) return true;
     if (this.isFatalQuotaIssue(err)) return false;
     const msg = err instanceof Error ? err.message : String(err);
     return (
@@ -164,7 +265,7 @@ Retourne UNIQUEMENT ce JSON (aucun texte autour) :
       model: this.modelId,
       systemInstruction: this.systemPrompt(),
       generationConfig: {
-        maxOutputTokens: 2048,
+        maxOutputTokens: 4096,
         responseMimeType: 'application/json',
       },
     });
@@ -178,7 +279,21 @@ Retourne UNIQUEMENT ce JSON (aucun texte autour) :
         const result = await model.generateContent(prompt);
         const response = result.response;
         const text = response.text().trim();
-
+        if (!text) {
+          const candidates = (
+            response as {
+              candidates?: Array<{ finishReason?: string; finishMessage?: string }>;
+            }
+          ).candidates;
+          const finishReasons = (candidates ?? []).map((c) => c.finishReason).filter(Boolean);
+          const finishMessages = (candidates ?? []).map((c) => c.finishMessage).filter(Boolean);
+          logger.warn('[Gemini] Réponse vide', {
+            developer: payload.developer.githubUsername,
+            finishReasons,
+            finishMessages,
+          });
+          throw new GeminiTransientOutputError('Gemini a retourné une réponse vide');
+        }
         const usage = response.usageMetadata;
         const parsed = this.parseJson(text);
 
@@ -197,18 +312,17 @@ Retourne UNIQUEMENT ce JSON (aucun texte autour) :
         if (this.isFatalQuotaIssue(err)) {
           logger.error('[Gemini] Quota ou plan API bloqué — pas de nouvelle tentative');
           throw new GeminiQuotaBlockedError(
-            '[Gemini] Quota Google AI indisponible pour ce projet/modèle (souvent limit: 0 sur le free tier ou quota journalier épuisé). Vérifie la facturation et les limites : https://ai.google.dev/gemini-api/docs/rate-limits — ou change GEMINI_MODEL / projet API.',
+            '[Gemini] Quota Google AI indisponible (limit: 0 ou quota journalier épuisé). Vérifier la facturation : https://ai.google.dev/gemini-api/docs/rate-limits',
             { cause: err }
           );
         }
         const retryable = this.isRetryableGeminiError(err);
-        if (!retryable || attempt >= maxRetries) {
-          throw err;
-        }
+        if (!retryable || attempt >= maxRetries) throw err;
+
         const suggested = this.retryAfterMsFromError(err);
         const backoff = suggested ?? Math.min(120_000, 4000 * Math.pow(2, attempt));
         logger.warn(
-          `[Gemini] ${payload.developer.githubUsername} — erreur quota/réseau, nouvelle tentative ${attempt + 1}/${maxRetries} dans ${Math.round(backoff / 1000)}s`
+          `[Gemini] ${payload.developer.githubUsername} — retry ${attempt + 1}/${maxRetries} dans ${Math.round(backoff / 1000)}s`
         );
         await this.sleep(backoff);
       }
@@ -219,6 +333,9 @@ Retourne UNIQUEMENT ce JSON (aucun texte autour) :
 
   private parseJson(text: string): LlmEvaluationOutput {
     let cleaned = text.replace(/```json\s*/g, '').replace(/```/g, '').trim();
+    if (!cleaned) {
+      throw new GeminiTransientOutputError('Gemini a retourné un texte vide');
+    }
     const firstBrace = cleaned.indexOf('{');
     const lastBrace = cleaned.lastIndexOf('}');
     if (firstBrace !== -1 && lastBrace !== -1) {
@@ -228,7 +345,7 @@ Retourne UNIQUEMENT ce JSON (aucun texte autour) :
       return JSON.parse(cleaned) as LlmEvaluationOutput;
     } catch {
       logger.error('[Gemini] JSON parse failed', { text: text.slice(0, 500) });
-      throw new Error('Gemini a retourné un JSON invalide');
+      throw new GeminiTransientOutputError('Gemini a retourné un JSON invalide');
     }
   }
 }

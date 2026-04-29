@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { Types } from 'mongoose';
 import { Evaluation, Developer } from '../models';
-import type { EvaluationStatus, ProposalType } from '../types';
+import type { EvaluationStatus, ProposalType, EvaluationPeriodType } from '../types';
 import asyncHandler from '../middleware/asyncHandler';
 import { HttpError } from '../middleware/errorHandler';
 
@@ -23,6 +23,7 @@ const PROPOSALS: readonly ProposalType[] = [
   'warning',
   'none',
 ];
+const PERIOD_TYPES: readonly EvaluationPeriodType[] = ['week', 'month', 'quarter'];
 
 function isEvaluationStatus(v: string): v is EvaluationStatus {
   return (STATUSES as readonly string[]).includes(v);
@@ -30,6 +31,10 @@ function isEvaluationStatus(v: string): v is EvaluationStatus {
 
 function isProposalType(v: string): v is ProposalType {
   return (PROPOSALS as readonly string[]).includes(v);
+}
+
+function isPeriodType(v: string): v is EvaluationPeriodType {
+  return (PERIOD_TYPES as readonly string[]).includes(v);
 }
 
 function parsePagination(req: { query: Record<string, unknown> }): { page: number; limit: number } {
@@ -97,6 +102,8 @@ router.get(
           developerId,
           fullName,
           githubUsername,
+          scores: e.scores,
+          githubAudit: e.githubAudit ?? null,
           overall: e.scores?.overall ?? 0,
         };
       })
@@ -105,7 +112,12 @@ router.get(
 
     res.json({
       data: {
-        period: { periodStart, periodEnd, label: latest.periodLabel },
+        period: {
+          periodStart,
+          periodEnd,
+          label: latest.periodLabel,
+          periodType: latest.periodType ?? 'week',
+        },
         averageOverall,
         evaluationsCount: list.length,
         proposalDistribution,
@@ -131,7 +143,7 @@ router.get(
       .sort({ periodEnd: -1 })
       .limit(12)
       .select(
-        'periodStart periodEnd periodLabel scores proposal status stats.commitsCount createdAt updatedAt'
+        'periodStart periodEnd periodLabel periodType scores githubAudit proposal status stats createdAt updatedAt'
       )
       .lean();
 
@@ -143,8 +155,10 @@ router.get(
         periodStart: e.periodStart,
         periodEnd: e.periodEnd,
         periodLabel: e.periodLabel,
-        commitsCount: e.stats?.commitsCount ?? 0,
+        periodType: e.periodType ?? 'week',
+        stats: e.stats,
         scores: e.scores,
+        githubAudit: e.githubAudit ?? null,
         proposal: e.proposal,
         status: e.status,
       }));
@@ -170,6 +184,9 @@ router.get(
     }
     if (typeof req.query.periodEnd === 'string' && !Number.isNaN(Date.parse(req.query.periodEnd))) {
       filter.periodEnd = { $lte: new Date(req.query.periodEnd) };
+    }
+    if (typeof req.query.periodType === 'string' && isPeriodType(req.query.periodType)) {
+      filter.periodType = req.query.periodType;
     }
     if (typeof req.query.minScore === 'string') {
       const n = Number(req.query.minScore);

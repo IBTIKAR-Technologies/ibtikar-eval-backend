@@ -20,6 +20,7 @@ export type EvaluationStatus = 'pending' | 'in_progress' | 'completed' | 'failed
 
 export type CronRunStatus = 'running' | 'success' | 'partial' | 'failed';
 export type CronTrigger = 'schedule' | 'manual' | 'startup';
+export type EvaluationPeriodType = 'week' | 'month' | 'quarter';
 
 export type ProposalType =
   | 'promotion'
@@ -32,11 +33,11 @@ export type ProposalType =
 
 export type Priority = 'low' | 'medium' | 'high';
 
-/** Période d'évaluation (semaine ISO typiquement) */
 export interface Period {
   start: Date;
   end: Date;
   label: string;
+  type: EvaluationPeriodType;
 }
 
 export interface JiraIssueSummary {
@@ -62,14 +63,25 @@ export interface JiraEvaluationContext {
   issues: JiraIssueSummary[];
 }
 
-/** Sortie JSON attendue du modèle d'évaluation (Gemini, etc.) */
+/** Métriques GitHub collectées via l'API (non évaluées par le LLM) */
+export interface GithubAuditData {
+  reposCount: number;    // repos distincts touchés par le dev sur la période
+  pullsCount: number;    // PRs ouvertes/fusionnées par le dev sur la période
+  commitsCount: number;  // = stats.commitsCount, dupliqué ici pour le bloc audit
+  clonesCount: number;   // champ conservé pour compatibilité, non utilisé comme KPI développeur
+}
+
+/** Sortie JSON attendue du modèle d'évaluation */
 export interface LlmEvaluationOutput {
   scores: {
-    codeQuality: number;
-    commitFrequency: number;
-    conventionAdherence: number;
-    technicalComplexity: number;
-    overall: number;
+    commits: {
+      normsScore: number;       // 0-100 : qualité des messages (conventional commits)
+      separationScore: number;  // 0-100 : atomicité des commits
+      frequencyScore: number;   // 0-100 : régularité sur la période
+    };
+    codeQuality: number;        // 0-100 : qualité globale du code produit
+    productivity: number;       // 0-100 : volume et complexité du travail utile
+    overall: number;            // 0-100 : score global pondéré
   };
   analysis: {
     summary: string;
@@ -86,7 +98,6 @@ export interface LlmEvaluationOutput {
   };
 }
 
-/** Métadonnées retournées avec la sortie du LLM */
 export interface LlmEvaluationResult extends LlmEvaluationOutput {
   _meta: {
     model: string;
@@ -129,4 +140,5 @@ export interface DeveloperEvaluationPayload {
     repoPlatform: string | undefined;
   }>;
   jira?: JiraEvaluationContext;
+  githubAudit?: GithubAuditData;
 }

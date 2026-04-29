@@ -1,5 +1,5 @@
 import { Schema, model, Document, Types } from 'mongoose';
-import type { EvaluationStatus, ProposalType, Priority } from '../types';
+import type { EvaluationStatus, ProposalType, Priority, EvaluationPeriodType } from '../types';
 
 export interface IEvaluation extends Omit<Document, 'model'> {
   _id: Types.ObjectId;
@@ -7,9 +7,11 @@ export interface IEvaluation extends Omit<Document, 'model'> {
   periodStart: Date;
   periodEnd: Date;
   periodLabel?: string;
+  periodType: EvaluationPeriodType;
   groups: Types.ObjectId[];
   repositories: Types.ObjectId[];
   commits: Types.ObjectId[];
+
   stats: {
     commitsCount: number;
     additions: number;
@@ -18,13 +20,18 @@ export interface IEvaluation extends Omit<Document, 'model'> {
     activeDays: number;
     languages: string[];
   };
+
   scores: {
+    commits?: {
+      normsScore: number;
+      separationScore: number;
+      frequencyScore: number;
+    };
     codeQuality?: number;
-    commitFrequency?: number;
-    conventionAdherence?: number;
-    technicalComplexity?: number;
+    productivity?: number;
     overall?: number;
   };
+
   analysis: {
     summary?: string;
     strengths: string[];
@@ -32,6 +39,14 @@ export interface IEvaluation extends Omit<Document, 'model'> {
     recommendations: string[];
     notableCommits: Array<{ sha: string; comment: string }>;
   };
+
+  githubAudit?: {
+    reposCount: number;
+    pullsCount: number;
+    commitsCount: number;
+    clonesCount: number;
+  };
+
   jira?: {
     accountId?: string;
     issuesCount: number;
@@ -52,12 +67,14 @@ export interface IEvaluation extends Omit<Document, 'model'> {
       url?: string;
     }>;
   };
+
   proposal: {
     type: ProposalType;
     title?: string;
     rationale?: string;
     priority: Priority;
   };
+
   model?: string;
   tokensUsed?: { input: number; output: number };
   status: EvaluationStatus;
@@ -73,6 +90,7 @@ const EvaluationSchema = new Schema<IEvaluation>(
     periodStart: { type: Date, required: true, index: true },
     periodEnd: { type: Date, required: true, index: true },
     periodLabel: { type: String },
+    periodType: { type: String, enum: ['week', 'month', 'quarter'], default: 'week', index: true },
 
     groups: [{ type: Schema.Types.ObjectId, ref: 'Group' }],
     repositories: [{ type: Schema.Types.ObjectId, ref: 'Repository' }],
@@ -88,10 +106,13 @@ const EvaluationSchema = new Schema<IEvaluation>(
     },
 
     scores: {
+      commits: {
+        normsScore: { type: Number, min: 0, max: 100 },
+        separationScore: { type: Number, min: 0, max: 100 },
+        frequencyScore: { type: Number, min: 0, max: 100 },
+      },
       codeQuality: { type: Number, min: 0, max: 100 },
-      commitFrequency: { type: Number, min: 0, max: 100 },
-      conventionAdherence: { type: Number, min: 0, max: 100 },
-      technicalComplexity: { type: Number, min: 0, max: 100 },
+      productivity: { type: Number, min: 0, max: 100 },
       overall: { type: Number, min: 0, max: 100, index: true },
     },
 
@@ -101,6 +122,13 @@ const EvaluationSchema = new Schema<IEvaluation>(
       weaknesses: [String],
       recommendations: [String],
       notableCommits: [{ sha: String, comment: String }],
+    },
+
+    githubAudit: {
+      reposCount: { type: Number, default: 0 },
+      pullsCount: { type: Number, default: 0 },
+      commitsCount: { type: Number, default: 0 },
+      clonesCount: { type: Number, default: 0 },
     },
 
     jira: {

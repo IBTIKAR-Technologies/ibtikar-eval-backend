@@ -8,6 +8,7 @@ import logger from './utils/logger';
 import apiRouter from './routes';
 import errorHandler from './middleware/errorHandler';
 import { startCron } from './jobs/evaluationCron';
+import { startJiraCron } from './jobs/evaluationJiraCron';
 
 const app = express();
 
@@ -28,6 +29,7 @@ app.use(errorHandler);
 async function bootstrap(): Promise<void> {
   await connectDB();
   startCron();
+  startJiraCron();
 
   const server = app.listen(config.port, () => {
     logger.info(`[Server] Écoute sur le port ${config.port}`);

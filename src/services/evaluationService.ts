@@ -1,6 +1,8 @@
 import pLimit from 'p-limit';
+import { Types } from 'mongoose';
 import {
   Developer,
+  Group,
   Repository,
   Commit,
   Evaluation,
@@ -15,12 +17,20 @@ import geminiService, { GeminiQuotaBlockedError } from './geminiService';
 import jiraService from './jiraService';
 import config from '../config';
 import logger from '../utils/logger';
-import type { Period, CronTrigger, DeveloperEvaluationPayload } from '../types';
+import type {
+  Period,
+  CronTrigger,
+  DeveloperEvaluationPayload,
+  GithubAuditData,
+  EvaluationPeriodType,
+} from '../types';
 
 interface RunOptions {
   periodStart?: Date;
   periodEnd?: Date;
+  periodType?: EvaluationPeriodType;
   trigger?: CronTrigger;
+  githubUsernames?: string[];
 }
 
 interface FetchResult {
@@ -34,10 +44,65 @@ interface EvalResult {
   errors: Array<{ at: string; message: string }>;
 }
 
+function inferPlatform(language: string | null | undefined): IRepository['platform'] {
+  if (!language) return 'other';
+  const l = language.toLowerCase();
+  if (['typescript', 'javascript', 'vue', 'html', 'css', 'scss', 'svelte'].includes(l)) return 'web';
+  if (['kotlin', 'swift', 'dart', 'objective-c'].includes(l)) return 'mobile';
+  if (['python', 'go', 'ruby', 'php', 'java', 'c#', 'rust', 'elixir', 'c++', 'scala'].includes(l)) {
+    return 'backend';
+  }
+  return 'other';
+}
+
 class EvaluationService {
+  private async resolveAutoRepoGroupId(): Promise<Types.ObjectId | null> {
+    const configured = config.github.defaultRepoGroupId?.trim();
+    if (configured) {
+      if (!Types.ObjectId.isValid(configured)) {
+        logger.warn(`[Sync] GITHUB_DEFAULT_REPO_GROUP_ID invalide (${configured})`);
+        return null;
+      }
+      return new Types.ObjectId(configured);
+    }
+
+    const fallbackSlug = 'github-unassigned';
+    const group = await Group.findOneAndUpdate(
+      { slug: fallbackSlug },
+      {
+        $setOnInsert: {
+          name: 'GitHub Unassigned',
+          slug: fallbackSlug,
+          category: 'other',
+          description: 'Groupe automatique pour les dépôts GitHub non encore rattachés.',
+        },
+      },
+      { upsert: true, new: true }
+    ).select('_id slug');
+
+    logger.info('[Sync] Groupe fallback actif pour les repos non rattachés', {
+      groupId: String(group._id),
+      slug: group.slug,
+    });
+    return group._id as Types.ObjectId;
+  }
+
   /** Cycle complet : sync repos → fetch commits → évaluations Gemini → save */
-  async runFullCycle({ periodStart, periodEnd, trigger = 'schedule' }: RunOptions = {}): Promise<ICronRun> {
-    const period = this.resolvePeriod(periodStart, periodEnd);
+  async runFullCycle({
+    periodStart,
+    periodEnd,
+    periodType = 'week',
+    githubUsernames,
+    trigger = 'schedule',
+  }: RunOptions = {}): Promise<ICronRun> {
+    const period = this.resolvePeriod(periodStart, periodEnd, periodType);
+    const normalizedGithubUsernames = Array.from(
+      new Set(
+        (githubUsernames ?? [])
+          .map((u) => u.trim().toLowerCase().replace(/^@+/, ''))
+          .filter(Boolean)
+      )
+    );
     const run = await CronRun.create({
       startedAt: new Date(),
       status: 'running',
@@ -50,16 +115,19 @@ class EvaluationService {
     logger.info(
       `[Cycle] Démarrage — ${period.label} (${period.start.toISOString()} → ${period.end.toISOString()})`
     );
+    if (normalizedGithubUsernames.length > 0) {
+      logger.info('[Cycle] Filtre développeurs actif', { githubUsernames: normalizedGithubUsernames });
+    }
 
     try {
       const reposScanned = await this.syncOrgRepos();
       run.counters.reposScanned = reposScanned;
 
-      const fetched = await this.fetchPeriodCommits(period);
+      const fetched = await this.fetchPeriodCommits(period, normalizedGithubUsernames);
       run.counters.commitsFetched = fetched.total;
       run.counters.commitsNew = fetched.saved;
 
-      const evalRes = await this.evaluateAllDevelopers(period);
+      const evalRes = await this.evaluateAllDevelopers(period, normalizedGithubUsernames);
       run.counters.developersEvaluated = evalRes.evaluated;
       run.counters.evaluationsCreated = evalRes.created;
       run.counters.errors = evalRes.errors.length;
@@ -82,25 +150,50 @@ class EvaluationService {
     }
   }
 
-  /** Résout la période : par défaut, les 7 derniers jours */
-  private resolvePeriod(start?: Date, end?: Date): Period {
+  /** Résout la période : semaine, mois ou trimestre (3 mois). */
+  private resolvePeriod(start?: Date, end?: Date, periodType: EvaluationPeriodType = 'week'): Period {
     if (start && end) {
       return {
         start: new Date(start),
         end: new Date(end),
         label: `Période ${new Date(start).toISOString().slice(0, 10)} → ${new Date(end).toISOString().slice(0, 10)}`,
+        type: periodType,
       };
     }
-    const now = new Date();
-    const periodEnd = new Date(now);
-    periodEnd.setUTCHours(23, 59, 59, 999);
-    const periodStart = new Date(periodEnd);
-    periodStart.setUTCDate(periodStart.getUTCDate() - 7);
-    periodStart.setUTCHours(0, 0, 0, 0);
+    const endDate = new Date();
+    endDate.setUTCHours(23, 59, 59, 999);
 
-    const weekNum = this.isoWeek(periodEnd);
-    const label = `Semaine ${periodEnd.getUTCFullYear()}-W${String(weekNum).padStart(2, '0')}`;
-    return { start: periodStart, end: periodEnd, label };
+    if (periodType === 'month') {
+      const startDate = new Date(endDate);
+      startDate.setUTCMonth(startDate.getUTCMonth() - 1);
+      startDate.setUTCHours(0, 0, 0, 0);
+      const ym = `${endDate.getUTCFullYear()}-${String(endDate.getUTCMonth() + 1).padStart(2, '0')}`;
+      return { start: startDate, end: endDate, label: `Mois ${ym}`, type: 'month' };
+    }
+
+    if (periodType === 'quarter') {
+      const startDate = new Date(endDate);
+      startDate.setUTCMonth(startDate.getUTCMonth() - 3);
+      startDate.setUTCHours(0, 0, 0, 0);
+      const q = Math.floor(endDate.getUTCMonth() / 3) + 1;
+      return { start: startDate, end: endDate, label: `Trimestre ${endDate.getUTCFullYear()}-T${q}`, type: 'quarter' };
+    }
+
+    const lookbackDays = config.cron.lookbackDays;
+    const startDate = new Date(endDate);
+    startDate.setUTCDate(startDate.getUTCDate() - lookbackDays);
+    startDate.setUTCHours(0, 0, 0, 0);
+    const weekNum = this.isoWeek(endDate);
+    const label =
+      lookbackDays === 7
+        ? `Semaine ${endDate.getUTCFullYear()}-W${String(weekNum).padStart(2, '0')}`
+        : `${lookbackDays} derniers jours (${startDate.toISOString().slice(0, 10)} → ${endDate.toISOString().slice(0, 10)})`;
+    return {
+      start: startDate,
+      end: endDate,
+      label,
+      type: 'week',
+    };
   }
 
   private isoWeek(date: Date): number {
@@ -116,6 +209,8 @@ class EvaluationService {
     const orgRepos = await githubService.listOrgRepos();
     logger.info(`[Sync] ${orgRepos.length} repos trouvés sur GitHub`);
 
+    const defaultRepoGroupId = await this.resolveAutoRepoGroupId();
+
     let count = 0;
     const notInDb: string[] = [];
     for (const r of orgRepos) {
@@ -123,6 +218,21 @@ class EvaluationService {
 
       const existing = await Repository.findOne({ fullName: r.fullName });
       if (!existing) {
+        if (defaultRepoGroupId) {
+          await Repository.create({
+            fullName: r.fullName,
+            githubRepoId: r.githubRepoId,
+            name: r.name,
+            language: r.language ?? undefined,
+            defaultBranch: r.defaultBranch,
+            isPrivate: r.isPrivate,
+            isArchived: r.isArchived,
+            platform: inferPlatform(r.language),
+            group: defaultRepoGroupId,
+          });
+          count++;
+          continue;
+        }
         if (notInDb.length < 25) notInDb.push(r.fullName);
         continue;
       }
@@ -144,14 +254,23 @@ class EvaluationService {
         `[Sync] ${skipped} repo(s) GitHub sans entrée en base (non rattachés à un Group). Exemples : ${notInDb.join(', ')}${extra}`
       );
     }
+    if (defaultRepoGroupId) {
+      logger.info(
+        '[Sync] Les repos manquants ont été auto-créés avec GITHUB_DEFAULT_REPO_GROUP_ID'
+      );
+    }
     logger.info(`[Sync] ${count} repos rattachés mis à jour`);
     return count;
   }
 
   /** 2. Récupère les commits de la période et les matche aux devs */
-  private async fetchPeriodCommits(period: Period): Promise<FetchResult> {
+  private async fetchPeriodCommits(period: Period, githubUsernames: string[] = []): Promise<FetchResult> {
     const repos = await Repository.find({ isArchived: false }).populate('group');
-    const developers = await Developer.find({ isActive: true });
+    const developerFilter =
+      githubUsernames.length > 0
+        ? { isActive: true, githubUsername: { $in: githubUsernames } }
+        : { isActive: true };
+    const developers = await Developer.find(developerFilter);
 
     const byLogin = new Map<string, IDeveloper>();
     const byEmail = new Map<string, IDeveloper>();
@@ -159,6 +278,7 @@ class EvaluationService {
       if (d.githubUsername) byLogin.set(d.githubUsername.toLowerCase(), d);
       for (const e of d.githubEmails ?? []) byEmail.set(e.toLowerCase(), d);
     }
+    const authorFilter = githubUsernames.length === 1 ? githubUsernames[0] : undefined;
 
     const limit = pLimit(4);
     let totalCommits = 0;
@@ -172,7 +292,8 @@ class EvaluationService {
             owner,
             name,
             period.start.toISOString(),
-            period.end.toISOString()
+            period.end.toISOString(),
+            authorFilter
           );
           totalCommits += ghCommits.length;
 
@@ -238,8 +359,12 @@ class EvaluationService {
   }
 
   /** 3. Pour chaque dev actif, agrège ses commits et appelle Gemini */
-  private async evaluateAllDevelopers(period: Period): Promise<EvalResult> {
-    const developers = await Developer.find({ isActive: true }).populate('groups');
+  private async evaluateAllDevelopers(period: Period, githubUsernames: string[] = []): Promise<EvalResult> {
+    const developerFilter =
+      githubUsernames.length > 0
+        ? { isActive: true, githubUsername: { $in: githubUsernames } }
+        : { isActive: true };
+    const developers = await Developer.find(developerFilter).populate('groups');
     const errors: Array<{ at: string; message: string }> = [];
     let evaluated = 0;
     let created = 0;
@@ -294,6 +419,7 @@ class EvaluationService {
       developer: dev._id,
       periodStart: period.start,
       periodEnd: period.end,
+      periodType: period.type,
     });
     if (existing && existing.status === 'completed') {
       logger.info(`[Eval] ${dev.githubUsername} déjà évalué pour ${period.label}`);
@@ -312,6 +438,22 @@ class EvaluationService {
       .limit(config.limits.maxCommitsPerDev);
 
     if (commits.length === 0) {
+      // Même sans commit, on collecte Jira + GitHub Audit pour avoir une vue complète.
+      const [jiraNoCommits, githubAuditNoCommits] = await Promise.all([
+        jiraService.getDeveloperContext({
+          developerEmail: dev.email,
+          developerUsername: dev.githubUsername,
+          period,
+          maxIssues: 25,
+        }),
+        this.collectGithubAudit(dev, [], period),
+      ]);
+
+      const hasJiraActivity = !!(jiraNoCommits && jiraNoCommits.issuesCount > 0);
+      const summary = hasJiraActivity
+        ? `Aucun commit sur la période. Activité Jira détectée : ${jiraNoCommits!.issuesCount} ticket(s) (${jiraNoCommits!.doneCount} done, ${jiraNoCommits!.inProgressCount} en cours).`
+        : 'Aucun commit sur la période.';
+
       await Evaluation.findOneAndUpdate(
         { developer: dev._id, periodStart: period.start, periodEnd: period.end },
         {
@@ -319,9 +461,31 @@ class EvaluationService {
           periodStart: period.start,
           periodEnd: period.end,
           periodLabel: period.label,
+          periodType: period.type,
           status: 'skipped',
-          stats: { commitsCount: 0 },
-          analysis: { summary: 'Aucun commit sur la période.', strengths: [], weaknesses: [], recommendations: [], notableCommits: [] },
+          stats: {
+            commitsCount: 0,
+            additions: 0,
+            deletions: 0,
+            filesChanged: 0,
+            activeDays: 0,
+            languages: [],
+          },
+          scores: {
+            commits: { normsScore: 0, separationScore: 0, frequencyScore: 0 },
+            codeQuality: 0,
+            productivity: 0,
+            overall: 0,
+          },
+          analysis: {
+            summary,
+            strengths: [],
+            weaknesses: [],
+            recommendations: [],
+            notableCommits: [],
+          },
+          githubAudit: githubAuditNoCommits,
+          jira: jiraNoCommits ?? undefined,
           proposal: { type: 'none', title: 'Aucune action', priority: 'low' },
         },
         { upsert: true, new: true }
@@ -365,7 +529,11 @@ class EvaluationService {
       })),
     };
 
-    // Activité Jira séparée (optionnelle) : stockée dans `evaluation.jira` et envoyée au prompt.
+    // GitHub Audit : métriques collectées depuis l'API GitHub (non évaluées par le LLM)
+    const githubAudit = await this.collectGithubAudit(dev, commits as unknown as ICommit[], period);
+    payload.githubAudit = githubAudit;
+
+    // Activité Jira (optionnelle)
     const jira = await jiraService.getDeveloperContext({
       developerEmail: dev.email,
       developerUsername: dev.githubUsername,
@@ -377,12 +545,13 @@ class EvaluationService {
     const llm = await geminiService.evaluateDeveloper(payload);
 
     await Evaluation.findOneAndUpdate(
-      { developer: dev._id, periodStart: period.start, periodEnd: period.end },
+      { developer: dev._id, periodStart: period.start, periodEnd: period.end, periodType: period.type },
       {
         developer: dev._id,
         periodStart: period.start,
         periodEnd: period.end,
         periodLabel: period.label,
+        periodType: period.type,
         groups: Array.from(
           new Set(commits.map((c) => String(c.group)).filter(Boolean))
         ),
@@ -393,6 +562,7 @@ class EvaluationService {
         stats,
         scores: llm.scores,
         analysis: llm.analysis,
+        githubAudit,
         jira: jira ?? undefined,
         proposal: llm.proposal,
         model: llm._meta.model,
@@ -408,6 +578,46 @@ class EvaluationService {
     );
 
     return { created: true };
+  }
+
+  /**
+   * Collecte les métriques GitHub Audit pour un développeur :
+   * repos distincts et PRs. Tolérant aux erreurs (retourne 0 si API indisponible).
+   */
+  private async collectGithubAudit(
+    dev: IDeveloper,
+    commits: ICommit[],
+    period: Period
+  ): Promise<GithubAuditData> {
+    const repoFullNames = Array.from(
+      new Set(
+        commits
+          .map((c) => (c.repository as unknown as IRepository)?.fullName)
+          .filter((n): n is string => !!n)
+      )
+    );
+
+    const [pullsCount] = await Promise.all([
+      githubService.getDeveloperPullRequestsCount(
+        dev.githubUsername,
+        period.start.toISOString(),
+        period.end.toISOString()
+      ),
+    ]);
+    // Important: le trafic clones GitHub est agrégé au niveau repo (tous utilisateurs)
+    // et ne représente pas l'activité d'un développeur précis.
+    const clonesCount = 0;
+
+    logger.info(
+      `[Audit] ${dev.githubUsername} — repos:${repoFullNames.length} PRs:${pullsCount}`
+    );
+
+    return {
+      reposCount: repoFullNames.length,
+      pullsCount,
+      commitsCount: commits.length,
+      clonesCount,
+    };
   }
 
   private aggregateStats(commits: ICommit[]) {

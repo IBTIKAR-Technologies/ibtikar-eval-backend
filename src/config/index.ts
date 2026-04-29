@@ -1,5 +1,6 @@
 import path from 'path';
 import dotenv from 'dotenv';
+import type { EvaluationPeriodType } from '../types';
 
 const root = process.cwd();
 dotenv.config({ path: path.resolve(root, '.env') });
@@ -29,11 +30,25 @@ function splitCsv(v?: string): string[] {
     .filter(Boolean);
 }
 
+function parseEvaluationPeriodType(raw?: string): EvaluationPeriodType {
+  const v = (raw ?? 'week').trim().toLowerCase();
+  if (v === 'week' || v === 'month' || v === 'quarter') return v;
+  if (v === '3mois' || v === '3months' || v === 'trimester' || v === 'trimestre') return 'quarter';
+  return 'week';
+}
+
 export interface AppConfig {
   env: string;
   port: number;
   mongo: { uri: string };
-  github: { token: string; org: string };
+  github: {
+    token: string;
+    org: string;
+    requestTimeoutMs: number;
+    requestMaxRetries: number;
+    /** ObjectId hex optionnel : utilisé comme `group` uniquement à la création d’un nouveau Repository (sync GitHub). */
+    defaultRepoGroupId?: string;
+  };
   gemini: {
     apiKey: string;
     model: string;
@@ -48,8 +63,17 @@ export interface AppConfig {
     apiToken?: string;
     projectKeys: string[];
     syncLookbackDays: number;
+    cronSchedule: string;
+    cronTimezone: string;
+    cronRunOnStart: boolean;
   };
-  cron: { schedule: string; timezone: string; runOnStart: boolean };
+  cron: {
+    schedule: string;
+    timezone: string;
+    runOnStart: boolean;
+    periodType: EvaluationPeriodType;
+    lookbackDays: number;
+  };
   limits: { maxCommitsPerDev: number; maxFilesPerCommit: number; maxDiffChars: number };
   dashboard: { origins: string[] };
 }
@@ -65,6 +89,9 @@ const config: AppConfig = {
   github: {
     token: required('GITHUB_TOKEN'),
     org: (process.env.GITHUB_ORG ?? '').trim() || 'Ibtikar',
+    requestTimeoutMs: Math.max(10_000, parseInt(process.env.GITHUB_REQUEST_TIMEOUT_MS ?? '60000', 10)),
+    requestMaxRetries: Math.max(1, parseInt(process.env.GITHUB_REQUEST_MAX_RETRIES ?? '5', 10)),
+    defaultRepoGroupId: process.env.GITHUB_DEFAULT_REPO_GROUP_ID?.trim() || undefined,
   },
 
   gemini: {
@@ -87,12 +114,17 @@ const config: AppConfig = {
     apiToken: process.env.JIRA_API_TOKEN?.trim(),
     projectKeys: splitCsv(process.env.JIRA_PROJECT_KEYS),
     syncLookbackDays: Math.max(1, parseInt(process.env.JIRA_SYNC_LOOKBACK_DAYS ?? '90', 10)),
+    cronSchedule: process.env.JIRA_CRON_SCHEDULE ?? '0 3 * * *',
+    cronTimezone: process.env.JIRA_CRON_TIMEZONE ?? 'Africa/Nouakchott',
+    cronRunOnStart: process.env.JIRA_CRON_RUN_ON_START === 'true',
   },
 
   cron: {
     schedule: process.env.CRON_SCHEDULE ?? '0 2 * * 1',
     timezone: process.env.CRON_TIMEZONE ?? 'Africa/Nouakchott',
     runOnStart: process.env.CRON_RUN_ON_START === 'true',
+    periodType: parseEvaluationPeriodType(process.env.CRON_PERIOD_TYPE ?? process.env.EVAL_PERIOD_TYPE),
+    lookbackDays: Math.max(1, parseInt(process.env.EVAL_LOOKBACK_DAYS ?? '7', 10)),
   },
 
   limits: {

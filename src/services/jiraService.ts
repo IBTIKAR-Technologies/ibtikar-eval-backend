@@ -3,6 +3,8 @@ import logger from '../utils/logger';
 import type { JiraEvaluationContext, JiraIssueSummary, Period } from '../types';
 
 interface JiraSearchResponse {
+  nextPageToken?: string;
+  isLast?: boolean;
   issues: Array<{
     key: string;
     fields: {
@@ -53,6 +55,10 @@ export interface JiraProjectWorkSummary {
 }
 
 class JiraService {
+  private static readonly REQUEST_TIMEOUT_MS = 45000;
+  private static readonly REQUEST_MAX_RETRIES = 4;
+  private static readonly PAGINATION_MAX_PAGES = 500;
+
   private readonly enabled: boolean;
   private readonly baseUrl?: string;
   private readonly email?: string;
@@ -79,17 +85,58 @@ class JiraService {
   private async requestJson<T>(path: string): Promise<T> {
     if (!this.baseUrl) throw new Error('[Jira] JIRA_BASE_URL manquant');
     const url = `${this.baseUrl.replace(/\/$/, '')}${path}`;
-    const resp = await fetch(url, {
-      headers: {
-        Authorization: this.authHeader(),
-        Accept: 'application/json',
-      },
-    });
-    if (!resp.ok) {
-      const body = await resp.text();
-      throw new Error(`[Jira] HTTP ${resp.status} sur ${path} — ${body.slice(0, 300)}`);
+    let lastError: Error | null = null;
+
+    for (let attempt = 1; attempt <= JiraService.REQUEST_MAX_RETRIES; attempt += 1) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), JiraService.REQUEST_TIMEOUT_MS);
+      try {
+        const resp = await fetch(url, {
+          headers: {
+            Authorization: this.authHeader(),
+            Accept: 'application/json',
+          },
+          signal: controller.signal,
+        });
+
+        if (resp.ok) {
+          return (await resp.json()) as T;
+        }
+
+        const body = await resp.text();
+        const isTransient = resp.status === 429 || resp.status >= 500;
+        if (isTransient && attempt < JiraService.REQUEST_MAX_RETRIES) {
+          const retryAfter = parseInt(resp.headers.get('retry-after') ?? '', 10);
+          const backoffMs = Number.isFinite(retryAfter)
+            ? Math.max(1000, retryAfter * 1000)
+            : attempt * 1500;
+          logger.warn(
+            `[Jira] HTTP ${resp.status} sur ${path} (tentative ${attempt}/${JiraService.REQUEST_MAX_RETRIES}) → retry dans ${backoffMs}ms`
+          );
+          await new Promise((r) => setTimeout(r, backoffMs));
+          continue;
+        }
+
+        throw new Error(`[Jira] HTTP ${resp.status} sur ${path} — ${body.slice(0, 300)}`);
+      } catch (err) {
+        const e = err instanceof Error ? err : new Error(String(err));
+        lastError = e;
+        const timedOut = e.name === 'AbortError';
+        const canRetry = attempt < JiraService.REQUEST_MAX_RETRIES;
+        if (canRetry) {
+          const backoffMs = attempt * 1500;
+          logger.warn(
+            `[Jira] ${timedOut ? 'Timeout' : 'Erreur réseau'} sur ${path} (tentative ${attempt}/${JiraService.REQUEST_MAX_RETRIES}) → retry dans ${backoffMs}ms`
+          );
+          await new Promise((r) => setTimeout(r, backoffMs));
+          continue;
+        }
+      } finally {
+        clearTimeout(timeout);
+      }
     }
-    return (await resp.json()) as T;
+
+    throw lastError ?? new Error(`[Jira] Échec requête sur ${path}`);
   }
 
   private async resolveAccountId(emailOrUsername: string): Promise<string | null> {
@@ -109,6 +156,22 @@ class JiraService {
       logger.warn(`[Jira] Impossible de résoudre accountId pour ${emailOrUsername}`);
       return null;
     }
+  }
+
+  private async searchIssues(params: {
+    jql: string;
+    fields: string[];
+    maxResults: number;
+    startAt?: number;
+    nextPageToken?: string;
+  }): Promise<JiraSearchResponse> {
+    const qp = new URLSearchParams();
+    qp.set('jql', params.jql);
+    qp.set('maxResults', String(params.maxResults));
+    qp.set('fields', params.fields.join(','));
+    if (params.nextPageToken) qp.set('nextPageToken', params.nextPageToken);
+    else qp.set('startAt', String(params.startAt ?? 0));
+    return this.requestJson<JiraSearchResponse>(`/rest/api/3/search/jql?${qp.toString()}`);
   }
 
   private normalizeIssue(issue: JiraSearchResponse['issues'][number]): JiraIssueSummary {
@@ -217,7 +280,13 @@ class JiraService {
     let startAt = 0;
     const maxResults = 50;
 
+    let pages = 0;
     while (true) {
+      pages += 1;
+      if (pages > JiraService.PAGINATION_MAX_PAGES) {
+        logger.warn('[Jira] Pagination projets interrompue: limite de pages atteinte');
+        break;
+      }
       const page = await this.requestJson<JiraProjectSearchResponse>(
         `/rest/api/3/project/search?startAt=${startAt}&maxResults=${maxResults}`
       );
@@ -246,12 +315,33 @@ class JiraService {
 
     const maxResults = 100;
     let startAt = 0;
+    let nextPageToken: string | undefined;
     const counts = new Map<string, JiraAssigneeSummary>();
 
+    let pages = 0;
+    let previousFirstIssueKey: string | null = null;
     while (true) {
-      const data = await this.requestJson<JiraSearchResponse>(
-        `/rest/api/3/search/jql?jql=${encodeURIComponent(jql)}&startAt=${startAt}&maxResults=${maxResults}&fields=assignee`
-      );
+      pages += 1;
+      if (pages > JiraService.PAGINATION_MAX_PAGES) {
+        logger.warn(`[Jira] ${projectKey}: pagination assignees interrompue (limite de pages)`);
+        break;
+      }
+      const data = await this.searchIssues({
+        jql,
+        startAt,
+        nextPageToken,
+        maxResults,
+        fields: ['assignee'],
+      });
+      const firstIssueKey = data.issues[0]?.key ?? null;
+      if (startAt > 0 && firstIssueKey && firstIssueKey === previousFirstIssueKey) {
+        logger.warn(
+          `[Jira] ${projectKey}: page Jira répétée détectée sur assignees (startAt=${startAt}), arrêt préventif`
+        );
+        break;
+      }
+      previousFirstIssueKey = firstIssueKey;
+
       for (const issue of data.issues) {
         const a = issue.fields.assignee;
         if (!a?.accountId) continue;
@@ -267,7 +357,9 @@ class JiraService {
           });
         }
       }
-      if (data.issues.length < maxResults) break;
+      if (data.isLast === true) break;
+      if (!data.nextPageToken && data.issues.length < maxResults) break;
+      nextPageToken = data.nextPageToken;
       startAt += maxResults;
     }
 
@@ -292,14 +384,36 @@ class JiraService {
 
     const maxResults = 100;
     let startAt = 0;
+    let nextPageToken: string | undefined;
     const all: JiraSearchResponse['issues'] = [];
 
+    let pages = 0;
+    let previousFirstIssueKey: string | null = null;
     while (true) {
-      const data = await this.requestJson<JiraSearchResponse>(
-        `/rest/api/3/search/jql?jql=${encodeURIComponent(jql)}&startAt=${startAt}&maxResults=${maxResults}&fields=summary,status,assignee,updated`
-      );
+      pages += 1;
+      if (pages > JiraService.PAGINATION_MAX_PAGES) {
+        logger.warn(`[Jira] ${projectKey}: pagination work summary interrompue (limite de pages)`);
+        break;
+      }
+      const data = await this.searchIssues({
+        jql,
+        startAt,
+        nextPageToken,
+        maxResults,
+        fields: ['summary', 'status', 'assignee', 'updated'],
+      });
+      const firstIssueKey = data.issues[0]?.key ?? null;
+      if (startAt > 0 && firstIssueKey && firstIssueKey === previousFirstIssueKey) {
+        logger.warn(
+          `[Jira] ${projectKey}: page Jira répétée détectée sur work summary (startAt=${startAt}), arrêt préventif`
+        );
+        break;
+      }
+      previousFirstIssueKey = firstIssueKey;
       all.push(...data.issues);
-      if (data.issues.length < maxResults) break;
+      if (data.isLast === true) break;
+      if (!data.nextPageToken && data.issues.length < maxResults) break;
+      nextPageToken = data.nextPageToken;
       startAt += maxResults;
     }
 

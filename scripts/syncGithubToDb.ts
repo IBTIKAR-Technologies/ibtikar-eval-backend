@@ -1,29 +1,20 @@
 /**
- * Import depuis GitHub : membres org → Developers, repos → Repositories + Groups
- * (équipes GitHub si le token le permet, sinon groupes par langage principal).
+ * Import depuis GitHub : membres org → Developers, métadonnées des repos → Repositories.
+ * Les Group ne sont pas créés/modifiés ici et les nouveaux repositories ne sont pas insérés.
+ * Ce script met à jour uniquement les dépôts déjà présents en base.
  *
  * Usage : yarn sync:github
  */
 import '../src/config';
+import pLimit from 'p-limit';
 import config from '../src/config';
 import { Types } from 'mongoose';
-import pLimit from 'p-limit';
 import { connectDB, disconnectDB } from '../src/config/database';
 import { Developer, Group, Repository } from '../src/models';
 import githubService from '../src/services/githubService';
 import type { OrgRepoInfo } from '../src/services/githubService';
 import logger from '../src/utils/logger';
 import type { RepoPlatform } from '../src/types';
-
-function slugify(name: string): string {
-  return name
-    .normalize('NFD')
-    .replace(/\p{Diacritic}/gu, '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 96);
-}
 
 function inferPlatform(language: string | null): RepoPlatform {
   if (!language) return 'other';
@@ -83,139 +74,55 @@ async function syncOrgMembers(enrichProfiles: boolean): Promise<void> {
   }
 }
 
-async function upsertGroupTeam(
-  org: string,
-  slug: string,
-  name: string,
-  description: string | null
-): Promise<Types.ObjectId> {
-  const groupSlug = slugify(`gh-team-${org}-${slug}`);
-  const groupName = `${name} · ${org}`;
-  const doc = await Group.findOneAndUpdate(
-    { slug: groupSlug },
+async function syncRepositoryMetadata(r: OrgRepoInfo): Promise<'updated' | 'skipped'> {
+  const setFields = {
+    githubRepoId: r.githubRepoId,
+    name: r.name,
+    language: r.language ?? undefined,
+    defaultBranch: r.defaultBranch,
+    isPrivate: r.isPrivate,
+    isArchived: r.isArchived,
+    platform: inferPlatform(r.language),
+  };
+
+  const existing = await Repository.findOne({ fullName: r.fullName }).select('_id group');
+  if (existing) {
+    await Repository.updateOne({ _id: existing._id }, { $set: setFields });
+    return 'updated';
+  }
+
+  return 'skipped';
+}
+
+async function resolveDefaultGroupIdForCreation(): Promise<Types.ObjectId | null> {
+  const configured = config.github.defaultRepoGroupId?.trim();
+  if (configured) {
+    if (!Types.ObjectId.isValid(configured)) {
+      logger.warn(`[SyncGH] GITHUB_DEFAULT_REPO_GROUP_ID invalide (${configured})`);
+      return null;
+    }
+    return new Types.ObjectId(configured);
+  }
+
+  const fallbackSlug = 'github-unassigned';
+  const group = await Group.findOneAndUpdate(
+    { slug: fallbackSlug },
     {
       $setOnInsert: {
-        name: groupName,
-        slug: groupSlug,
-        description: description ?? `Équipe GitHub « ${slug} »`,
-        category: 'mixed',
-        repositories: [],
-        leads: [],
-        isActive: true,
+        name: 'GitHub Unassigned',
+        slug: fallbackSlug,
+        category: 'other',
+        description: 'Groupe automatique pour les dépôts GitHub non encore rattachés.',
       },
     },
     { upsert: true, new: true }
-  );
-  return doc._id;
-}
+  ).select('_id slug');
 
-async function upsertGroupLanguage(org: string, languageLabel: string): Promise<Types.ObjectId> {
-  const groupSlug = slugify(`gh-lang-${org}-${languageLabel}`);
-  const groupName = `Langage — ${languageLabel} · ${org}`;
-  const doc = await Group.findOneAndUpdate(
-    { slug: groupSlug },
-    {
-      $setOnInsert: {
-        name: groupName,
-        slug: groupSlug,
-        description: 'Dépôts sans équipe GitHub dédiée (regroupement par langage)',
-        category: 'mixed',
-        repositories: [],
-        leads: [],
-        isActive: true,
-      },
-    },
-    { upsert: true, new: true }
-  );
-  return doc._id;
-}
-
-async function syncTeamsAndRepos(
-  org: string
-): Promise<Map<string, Types.ObjectId>> {
-  const repoToGroup = new Map<string, Types.ObjectId>();
-  const teams = await githubService.listOrgTeams();
-
-  if (teams.length === 0) {
-    logger.info('[SyncGH] Aucune équipe GitHub exploitable — tous les repos iront dans des groupes par langage');
-    return repoToGroup;
-  }
-
-  logger.info(`[SyncGH] ${teams.length} équipe(s) GitHub`);
-
-  for (const t of teams) {
-    let groupId: Types.ObjectId;
-    try {
-      groupId = await upsertGroupTeam(org, t.slug, t.name, t.description);
-    } catch (err) {
-      logger.warn(`[SyncGH] Ignorer équipe ${t.slug}`, err);
-      continue;
-    }
-
-    const teamRepos = await githubService.listTeamRepos(t.slug);
-    for (const r of teamRepos) {
-      if (!r.isArchived) {
-        repoToGroup.set(r.fullName, groupId);
-      }
-    }
-
-    try {
-      const teamMembers = await githubService.listTeamMembers(t.slug);
-      for (const mem of teamMembers) {
-        await Developer.findOneAndUpdate(
-          { githubUsername: mem.login.toLowerCase() },
-          {
-            $setOnInsert: {
-              githubUsername: mem.login.toLowerCase(),
-              fullName: mem.login,
-              role: 'other',
-              joinedAt: new Date(),
-              groups: [],
-            },
-            $addToSet: { groups: groupId },
-            $set: { githubUserId: mem.id, isActive: true },
-          },
-          { upsert: true }
-        );
-      }
-      logger.info(`[SyncGH] Équipe « ${t.name} » : ${teamRepos.length} repo(s), ${teamMembers.length} membre(s)`);
-    } catch (err: unknown) {
-      const e = err as { status?: number };
-      logger.warn(`[SyncGH] Membres équipe ${t.slug} indisponibles (${e.status ?? '?'})`);
-    }
-  }
-
-  return repoToGroup;
-}
-
-async function upsertRepositoryDoc(r: OrgRepoInfo, groupId: Types.ObjectId): Promise<void> {
-  await Repository.findOneAndUpdate(
-    { fullName: r.fullName },
-    {
-      $set: {
-        githubRepoId: r.githubRepoId,
-        name: r.name,
-        language: r.language ?? undefined,
-        defaultBranch: r.defaultBranch,
-        isPrivate: r.isPrivate,
-        isArchived: r.isArchived,
-        group: groupId,
-        platform: inferPlatform(r.language),
-      },
-      $setOnInsert: {
-        fullName: r.fullName,
-      },
-    },
-    { upsert: true }
-  );
-}
-
-async function rebuildGroupRepositories(): Promise<void> {
-  const groups = await Group.find({}).select('_id').lean();
-  for (const g of groups) {
-    const ids = await Repository.find({ group: g._id }).distinct('_id');
-    await Group.updateOne({ _id: g._id }, { $set: { repositories: ids } });
-  }
+  logger.info('[SyncGH] Groupe fallback actif pour la création des repos', {
+    groupId: String(group._id),
+    slug: group.slug,
+  });
+  return group._id as Types.ObjectId;
 }
 
 async function main(): Promise<void> {
@@ -223,51 +130,104 @@ async function main(): Promise<void> {
   const enrich =
     process.env.SYNC_GITHUB_ENRICH_PROFILES !== 'false' &&
     process.env.SYNC_GITHUB_ENRICH_PROFILES !== '0';
+  const createMissingRepos =
+    process.env.SYNC_GITHUB_CREATE_MISSING_REPOS === 'true' ||
+    process.env.SYNC_GITHUB_CREATE_MISSING_REPOS === '1';
 
   await connectDB();
   try {
     logger.info(`[SyncGH] Organisation : ${org}`);
+    logger.info(
+      createMissingRepos
+        ? '[SyncGH] Mode insertion: les dépôts manquants seront créés'
+        : '[SyncGH] Mode strict: seuls les dépôts déjà en base seront mis à jour'
+    );
 
-    await syncOrgMembers(enrich);
+    const defaultGroupId = createMissingRepos ? await resolveDefaultGroupIdForCreation() : null;
 
-    const repoToGroup = await syncTeamsAndRepos(org);
+    try {
+      await syncOrgMembers(enrich);
+    } catch (err) {
+      logger.warn(
+        '[SyncGH] Impossible de synchroniser les membres org (GitHub timeout/5xx après retries). Poursuite avec les repos.',
+        err instanceof Error ? err : new Error(String(err))
+      );
+    }
 
     const allRepos = await githubService.listOrgRepos();
     let archived = 0;
-    let linked = 0;
-    let byLang = 0;
+    let updated = 0;
+    let inserted = 0;
+    let skippedNew = 0;
+    const skippedExamples: string[] = [];
 
     for (const r of allRepos) {
       if (r.isArchived) {
-        archived++;
+        const ex = await Repository.findOne({ fullName: r.fullName }).select('_id');
+        if (ex) {
+          await Repository.updateOne(
+            { _id: ex._id },
+            {
+              $set: {
+                githubRepoId: r.githubRepoId,
+                name: r.name,
+                language: r.language ?? undefined,
+                defaultBranch: r.defaultBranch,
+                isPrivate: r.isPrivate,
+                isArchived: true,
+                platform: inferPlatform(r.language),
+              },
+            }
+          );
+          updated++;
+        } else {
+          archived++;
+        }
         continue;
       }
-
-      let groupId = repoToGroup.get(r.fullName);
-      if (!groupId) {
-        const label = r.language ?? 'Autre';
-        groupId = await upsertGroupLanguage(org, label);
-        byLang++;
-      } else {
-        linked++;
+      const res = await syncRepositoryMetadata(r);
+      if (res === 'updated') {
+        updated++;
       }
-
-      await upsertRepositoryDoc(r, groupId);
+      else {
+        if (createMissingRepos && defaultGroupId) {
+          await Repository.create({
+            fullName: r.fullName,
+            githubRepoId: r.githubRepoId,
+            name: r.name,
+            language: r.language ?? undefined,
+            defaultBranch: r.defaultBranch,
+            isPrivate: r.isPrivate,
+            isArchived: r.isArchived,
+            platform: inferPlatform(r.language),
+            group: defaultGroupId,
+          });
+          inserted++;
+        } else {
+          skippedNew++;
+          if (skippedExamples.length < 25) skippedExamples.push(r.fullName);
+        }
+      }
     }
-
-    await rebuildGroupRepositories();
 
     const devCount = await Developer.countDocuments({});
     const repoCount = await Repository.countDocuments({});
-    const groupCount = await Group.countDocuments({});
+
+    if (skippedNew > 0) {
+      const extra = skippedNew > skippedExamples.length ? ` (+${skippedNew - skippedExamples.length} autres)` : '';
+      logger.warn(
+        `[SyncGH] ${skippedNew} nouveau(x) dépôt(s) ignoré(s) (non présents en base). ` +
+          `Exemples : ${skippedExamples.join(', ')}${extra}.`
+      );
+    }
 
     logger.info('[SyncGH] Terminé', {
       developers: devCount,
       repositories: repoCount,
-      groups: groupCount,
-      reposArchivedSkipped: archived,
-      reposViaTeam: linked,
-      reposViaLanguageFallback: byLang,
+      reposArchivedNotInDb: archived,
+      reposMetadataUpdated: updated,
+      reposInserted: inserted,
+      reposSkippedNewNotInDb: skippedNew,
     });
   } finally {
     await disconnectDB();
